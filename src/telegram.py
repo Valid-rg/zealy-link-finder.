@@ -1,7 +1,7 @@
 """
 Telegram integration for Zealy Campaign Link Finder.
 
-Credentials are loaded from GitHub Actions environment variables.
+Credentials are loaded from environment variables.
 They are never stored in this file.
 """
 
@@ -51,11 +51,17 @@ def telegram_request(
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(
+            request,
+            timeout=30,
+        ) as response:
             response_data = response.read().decode("utf-8")
 
     except urllib.error.HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
+        body = error.read().decode(
+            "utf-8",
+            errors="replace",
+        )
 
         raise RuntimeError(
             f"Telegram API error ({error.code}): {body}"
@@ -84,7 +90,9 @@ def send_message(message: str) -> None:
     )
 
     if not message.strip():
-        raise ValueError("Telegram message cannot be empty.")
+        raise ValueError(
+            "Telegram message cannot be empty."
+        )
 
     telegram_request(
         "sendMessage",
