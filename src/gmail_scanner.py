@@ -59,7 +59,10 @@ def decode_email_header(value: str | None) -> str:
     return "".join(decoded_parts)
 
 
-def decode_payload(payload: bytes, charset: str | None) -> str:
+def decode_payload(
+    payload: bytes,
+    charset: str | None,
+) -> str:
     """Decode an email payload safely."""
 
     try:
@@ -224,4 +227,145 @@ def fetch_google_alert_emails(
                     continue
 
                 if status != "OK" or not data:
-                   
+                    continue
+
+                message_ids = data[0].split()
+
+                # Only inspect the most recent messages
+                # for this search.
+                message_ids = message_ids[-limit:]
+
+                for message_id in message_ids:
+                    candidate_messages.append(
+                        (
+                            folder,
+                            message_id,
+                        )
+                    )
+
+        results: list[dict[str, str]] = []
+        seen_message_ids: set[str] = set()
+
+        for folder, message_id in reversed(
+            candidate_messages
+        ):
+            try:
+                status, _ = mailbox.select(
+                    folder,
+                    readonly=True,
+                )
+
+                if status != "OK":
+                    continue
+
+                status, message_data = mailbox.fetch(
+                    message_id,
+                    "(RFC822)",
+                )
+
+            except imaplib.IMAP4.error:
+                continue
+
+            if status != "OK":
+                continue
+
+            raw_email = None
+
+            for item in message_data:
+                if isinstance(item, tuple) and len(item) >= 2:
+                    raw_email = item[1]
+                    break
+
+            if not raw_email:
+                continue
+
+            try:
+                message = email.message_from_bytes(
+                    raw_email
+                )
+            except Exception:
+                continue
+
+            subject = decode_email_header(
+                message.get("Subject")
+            )
+
+            sender = decode_email_header(
+                message.get("From")
+            )
+
+            if not is_google_alert(
+                sender,
+                subject,
+            ):
+                continue
+
+            date = decode_email_header(
+                message.get("Date")
+            )
+
+            message_id_header = (
+                message.get("Message-ID") or ""
+            )
+
+            # Prevent the same email from being returned twice
+            # when it appears in both Inbox and All Mail.
+            unique_id = (
+                message_id_header
+                or (
+                    f"{folder}:"
+                    f"{message_id.decode(errors='replace')}"
+                )
+            )
+
+            if unique_id in seen_message_ids:
+                continue
+
+            seen_message_ids.add(unique_id)
+
+            body = extract_text_from_message(
+                message
+            )
+
+            results.append(
+                {
+                    "message_id": message_id_header,
+                    "subject": subject,
+                    "sender": sender,
+                    "date": date,
+                    "body": body,
+                }
+            )
+
+            if len(results) >= limit:
+                break
+
+        return results
+
+    finally:
+        try:
+            mailbox.logout()
+        except Exception:
+            pass
+
+
+def scan_google_alerts() -> Iterable[dict[str, str]]:
+    """Public helper used by the main application."""
+
+    return fetch_google_alert_emails()
+
+
+if __name__ == "__main__":
+    emails = list(scan_google_alerts())
+
+    print(
+        f"Found {len(emails)} Google Alert email(s)."
+    )
+
+    for index, item in enumerate(
+        emails,
+        start=1,
+    ):
+        print(
+            f"{index}. {item['subject']}"
+)
