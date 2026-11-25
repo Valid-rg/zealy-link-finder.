@@ -1,178 +1,146 @@
-import json
-import os
-import time
-from pathlib import Path
-from urllib.parse import urlparse
+"""
+Zealy Campaign Link Finder
 
-import requests
+Core link extraction and deduplication logic.
 
-X_BEARER_TOKEN = os.environ["X_BEARER_TOKEN"]
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+The production bot will receive Google Alert emails through Gmail,
+extract Zealy campaign links, normalize them, and send only new
+links to Telegram.
+"""
 
-API_URL = "https://api.x.com/2/tweets/search/recent"
-TELEGRAM_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-QUERY = "url:zealy.io has:links"
-STATE_FILE = Path("state.json")
+from __future__ import annotations
+
+import re
+from urllib.parse import urlsplit, urlunsplit
 
 
-def load_state():
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    return {"baseline_complete": False, "since_id": None}
+ZEALY_CAMPAIGN_PATTERN = re.compile(
+    r"https?://(?:www\.)?zealy\.io/cw/[^\s<>\"]+",
+    re.IGNORECASE,
+)
 
 
-def save_state(state):
-    STATE_FILE.write_text(
-        json.dumps(state, indent=2) + "\n",
-        encoding="utf-8"
+def normalize_zealy_url(url: str) -> str | None:
+    """
+    Convert a Zealy campaign URL into a consistent form.
+
+    Examples:
+        https://zealy.io/cw/example/
+        https://www.zealy.io/cw/example?utm_source=google
+
+    Both become:
+
+        https://zealy.io/cw/example
+    """
+
+    url = url.strip()
+
+    # Remove common punctuation that may be attached to a URL
+    url = url.rstrip(".,;:!?)]}>\"'")
+
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+
+    if parsed.scheme.lower() != "https":
+        return None
+
+    if parsed.netloc.lower() not in {"zealy.io", "www.zealy.io"}:
+        return None
+
+    path = parsed.path.rstrip("/")
+
+    if not path.lower().startswith("/cw/"):
+        return None
+
+    # Prevent an empty campaign slug.
+    if path.lower() == "/cw":
+        return None
+
+    # Tracking/query parameters are deliberately removed.
+    # The campaign URL itself is what matters.
+    return urlunsplit(
+        (
+            "https",
+            "zealy.io",
+            path,
+            "",
+            "",
+        )
     )
 
 
-def x_get(params):
-    headers = {"Authorization": f"Bearer {X_BEARER_TOKEN}"}
-    last_error = None
+def extract_zealy_links(text: str) -> list[str]:
+    """
+    Find all Zealy campaign links in a block of text.
 
-    for attempt in range(4):
-        try:
-            response = requests.get(
-                API_URL, headers=headers, params=params, timeout=30
-            )
-            if response.status_code == 429:
-                wait = int(response.headers.get("x-rate-limit-reset", "0")) - int(time.time())
-                time.sleep(max(5, min(wait, 60)))
-                continue
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as exc:
-            last_error = exc
-            if attempt == 3:
-                raise
-            time.sleep(2 ** attempt)
+    Returns unique normalized URLs while preserving their order.
+    """
 
-    raise RuntimeError(f"X API request failed: {last_error}")
+    if not text:
+        return []
 
+    found: list[str] = []
+    seen: set[str] = set()
 
-def is_target_zealy_url(url):
-    try:
-        parsed = urlparse(url)
-        host = (parsed.hostname or "").lower()
-        return host in {"zealy.io", "www.zealy.io"} and parsed.path.startswith("/cw/")
-    except ValueError:
-        return False
+    for match in ZEALY_CAMPAIGN_PATTERN.findall(text):
+        normalized = normalize_zealy_url(match)
 
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            found.append(normalized)
 
-def matching_campaign_urls(post):
-    found = []
-    entities = post.get("entities") or {}
-    for item in entities.get("urls", []):
-        # expanded_url resolves X's t.co wrapper to the destination.
-        candidate = item.get("expanded_url") or item.get("unwound_url") or item.get("url")
-        if candidate and is_target_zealy_url(candidate) and candidate not in found:
-            found.append(candidate)
     return found
 
 
-def send_telegram(message):
-    response = requests.post(
-        TELEGRAM_URL,
-        data={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message[:4000],
-            "disable_web_page_preview": True,
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if not payload.get("ok"):
-        raise RuntimeError(f"Telegram rejected message: {payload}")
+def find_new_links(
+    links: list[str],
+    previously_seen: set[str],
+) -> list[str]:
+    """
+    Return only links that have not previously been processed.
+    """
+
+    new_links: list[str] = []
+
+    for link in links:
+        normalized = normalize_zealy_url(link)
+
+        if normalized and normalized not in previously_seen:
+            previously_seen.add(normalized)
+            new_links.append(normalized)
+
+    return new_links
 
 
-def fetch_posts(since_id=None, start_time=None):
-    params = {
-        "query": QUERY,
-        "max_results": 100,
-        "tweet.fields": "created_at,author_id,entities",
-        "expansions": "author_id",
-        "user.fields": "username,name",
-    }
-    if since_id:
-        params["since_id"] = since_id
-    elif start_time:
-        params["start_time"] = start_time
+def main() -> None:
+    """
+    Local smoke test.
 
-    posts = []
-    users = {}
+    This does not connect to Gmail or Telegram.
+    """
 
-    while True:
-        data = x_get(params)
-        posts.extend(data.get("data", []))
-        for user in data.get("includes", {}).get("users", []):
-            users[user["id"]] = user
-        next_token = data.get("meta", {}).get("next_token")
-        if not next_token:
-            break
-        params["next_token"] = next_token
+    sample_email = """
+    New Web3 campaign:
+    https://zealy.io/cw/example-project
 
-    return posts, users
+    Another campaign:
+    https://www.zealy.io/cw/another-project/?utm_source=google
 
+    Duplicate:
+    https://zealy.io/cw/example-project/
+    """
 
-def main():
-    state = load_state()
+    seen: set[str] = set()
 
-    if not state.get("baseline_complete"):
-        # Establish a time boundary on the first run. Existing results are
-        # intentionally ignored; if there are none, start_time still ensures
-        # that the first later post is not accidentally treated as history.
-        from datetime import datetime, timezone
-        baseline_time = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-        posts, users = fetch_posts()
-        if posts:
-            state["since_id"] = max(posts, key=lambda p: int(p["id"]))["id"]
-        else:
-            state["baseline_time"] = baseline_time
-        state["baseline_complete"] = True
-        save_state(state)
-        print(f"Initial baseline established at post ID {state.get('since_id')} or time {state.get('baseline_time')}.")
-        return
+    links = extract_zealy_links(sample_email)
+    new_links = find_new_links(links, seen)
 
-    posts, users = fetch_posts(
-        state.get("since_id"),
-        state.get("baseline_time") if not state.get("since_id") else None
-    )
+    print("Detected Zealy campaigns:")
 
-    if not posts:
-        print("No new X posts to inspect.")
-        return
-
-    # Process oldest first so since_id can safely advance after each post.
-    posts.sort(key=lambda p: int(p["id"]))
-
-    for post in posts:
-        post_id = post["id"]
-        username = users.get(post.get("author_id"), {}).get("username", "unknown")
-        post_url = f"https://x.com/{username}/status/{post_id}"
-        campaign_urls = matching_campaign_urls(post)
-
-        if campaign_urls:
-            links = "\n".join(campaign_urls)
-            text = post.get("text", "")
-            message = (
-                "NEW ZEALY CAMPAIGN LINK\n\n"
-                f"Found in post by @{username}\n"
-                f"Date: {post.get('created_at', 'Unknown')}\n\n"
-                f"Post:\n{text}\n\n"
-                f"Campaign link(s):\n{links}\n\n"
-                f"Original X post:\n{post_url}"
-            )
-            # Advance state only after Telegram confirms the alert was sent.
-            send_telegram(message)
-
-        state["since_id"] = post_id
-        save_state(state)
-
-    print(f"Processed {len(posts)} new X posts.")
+    for link in new_links:
+        print(link)
 
 
 if __name__ == "__main__":
