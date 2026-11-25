@@ -1,11 +1,10 @@
 """
 Gmail scanner for Zealy Campaign Link Finder.
 
-This module connects to Gmail using IMAP, searches for Google Alert
-emails, extracts their text, and returns the email contents.
+Connects to Gmail using IMAP, finds Google Alert emails,
+and returns their contents for Zealy link extraction.
 
-It does NOT send Telegram messages and does NOT store credentials
-in the source code.
+Credentials are loaded from GitHub Actions environment variables.
 """
 
 from __future__ import annotations
@@ -20,6 +19,8 @@ from typing import Iterable
 
 GMAIL_IMAP_HOST = "imap.gmail.com"
 GMAIL_IMAP_PORT = 993
+
+GOOGLE_ALERT_SENDER = "googlealerts-noreply@google.com"
 
 
 def get_required_environment_variable(name: str) -> str:
@@ -47,7 +48,10 @@ def decode_email_header(value: str | None) -> str:
     for part, encoding in parts:
         if isinstance(part, bytes):
             decoded_parts.append(
-                part.decode(encoding or "utf-8", errors="replace")
+                part.decode(
+                    encoding or "utf-8",
+                    errors="replace",
+                )
             )
         else:
             decoded_parts.append(part)
@@ -55,14 +59,27 @@ def decode_email_header(value: str | None) -> str:
     return "".join(decoded_parts)
 
 
+def decode_payload(payload: bytes, charset: str | None) -> str:
+    """Decode an email payload safely."""
+
+    try:
+        return payload.decode(
+            charset or "utf-8",
+            errors="replace",
+        )
+    except LookupError:
+        return payload.decode(
+            "utf-8",
+            errors="replace",
+        )
+
+
 def extract_text_from_message(message: Message) -> str:
     """
-    Extract readable text from an email message.
+    Extract readable text and HTML from an email.
 
-    Handles:
-    - text/plain
-    - text/html
-    - multipart messages
+    Both text/plain and text/html are kept because
+    Google Alert emails may contain Zealy links inside HTML.
     """
 
     text_parts: list[str] = []
@@ -71,7 +88,10 @@ def extract_text_from_message(message: Message) -> str:
         for part in message.walk():
             content_type = part.get_content_type()
 
-            if content_type not in {"text/plain", "text/html"}:
+            if content_type not in {
+                "text/plain",
+                "text/html",
+            }:
                 continue
 
             if part.get_content_disposition() == "attachment":
@@ -82,37 +102,29 @@ def extract_text_from_message(message: Message) -> str:
             if payload is None:
                 continue
 
-            charset = part.get_content_charset() or "utf-8"
-
-            try:
-                text_parts.append(
-                    payload.decode(charset, errors="replace")
+            text_parts.append(
+                decode_payload(
+                    payload,
+                    part.get_content_charset(),
                 )
-            except LookupError:
-                text_parts.append(
-                    payload.decode("utf-8", errors="replace")
-                )
+            )
 
     else:
         payload = message.get_payload(decode=True)
 
         if payload:
-            charset = message.get_content_charset() or "utf-8"
-
-            try:
-                text_parts.append(
-                    payload.decode(charset, errors="replace")
+            text_parts.append(
+                decode_payload(
+                    payload,
+                    message.get_content_charset(),
                 )
-            except LookupError:
-                text_parts.append(
-                    payload.decode("utf-8", errors="replace")
-                )
+            )
 
     return "\n".join(text_parts)
 
 
 def connect_to_gmail() -> imaplib.IMAP4_SSL:
-    """Connect and authenticate to Gmail using environment variables."""
+    """Connect and authenticate to Gmail."""
 
     email_address = get_required_environment_variable(
         "GMAIL_ADDRESS"
@@ -135,120 +147,81 @@ def connect_to_gmail() -> imaplib.IMAP4_SSL:
     return mailbox
 
 
+def is_google_alert(
+    sender: str,
+    subject: str,
+) -> bool:
+    """
+    Check whether an email appears to be a Google Alert.
+
+    We accept either:
+    - the normal Google Alerts sender, or
+    - a subject containing "Google Alert".
+    """
+
+    sender_lower = sender.lower()
+    subject_lower = subject.lower()
+
+    return (
+        GOOGLE_ALERT_SENDER in sender_lower
+        or "google alert" in subject_lower
+    )
+
+
 def fetch_google_alert_emails(
     limit: int = 25,
 ) -> list[dict[str, str]]:
     """
-    Fetch recent Google Alert emails from Gmail.
+    Fetch recent Google Alert emails.
 
-    Returns a list containing:
-    - message_id
-    - subject
-    - sender
-    - date
-    - body
+    Searches both:
+    - Gmail Inbox
+    - Gmail All Mail
+
+    It also searches by both sender and subject so that
+    small changes in Gmail's email formatting do not break
+    the scanner.
     """
 
     mailbox = connect_to_gmail()
 
     try:
-        status, _ = mailbox.select("INBOX", readonly=True)
+        candidate_messages: list[
+            tuple[str, bytes]
+        ] = []
 
-        if status != "OK":
-            raise RuntimeError("Could not open Gmail inbox.")
+        folders = [
+            "INBOX",
+            "[Gmail]/All Mail",
+        ]
 
-        # Google Alerts normally arrives from Google Alerts.
-        # We deliberately keep the search broad enough that it can
-        # still work if Gmail formats the sender slightly differently.
-        status, data = mailbox.search(
-            None,
+        search_queries = [
             '(FROM "googlealerts-noreply@google.com")',
-        )
+            '(SUBJECT "Google Alert")',
+        ]
 
-        if status != "OK":
-            raise RuntimeError("Gmail search failed.")
+        for folder in folders:
+            try:
+                status, _ = mailbox.select(
+                    folder,
+                    readonly=True,
+                )
 
-        message_ids = data[0].split()
+                if status != "OK":
+                    continue
 
-        # Only inspect the most recent messages.
-        message_ids = message_ids[-limit:]
-
-        results: list[dict[str, str]] = []
-
-        for message_id in reversed(message_ids):
-            status, message_data = mailbox.fetch(
-                message_id,
-                "(RFC822)",
-            )
-
-            if status != "OK":
+            except imaplib.IMAP4.error:
                 continue
 
-            raw_email = None
+            for query in search_queries:
+                try:
+                    status, data = mailbox.search(
+                        None,
+                        query,
+                    )
 
-            for item in message_data:
-                if isinstance(item, tuple) and len(item) >= 2:
-                    raw_email = item[1]
-                    break
+                except imaplib.IMAP4.error:
+                    continue
 
-            if not raw_email:
-                continue
-
-            message = email.message_from_bytes(raw_email)
-
-            subject = decode_email_header(
-                message.get("Subject")
-            )
-
-            sender = decode_email_header(
-                message.get("From")
-            )
-
-            date = decode_email_header(
-                message.get("Date")
-            )
-
-            message_id_header = (
-                message.get("Message-ID") or ""
-            )
-
-            body = extract_text_from_message(message)
-
-            results.append(
-                {
-                    "message_id": message_id_header,
-                    "subject": subject,
-                    "sender": sender,
-                    "date": date,
-                    "body": body,
-                }
-            )
-
-        return results
-
-    finally:
-        try:
-            mailbox.logout()
-        except Exception:
-            pass
-
-
-def scan_google_alerts() -> Iterable[dict[str, str]]:
-    """
-    Public helper used by the main application.
-    """
-
-    return fetch_google_alert_emails()
-
-
-if __name__ == "__main__":
-    emails = list(scan_google_alerts())
-
-    print(f"Found {len(emails)} Google Alert email(s).")
-
-    for item in emails:
-        print("-" * 60)
-        print(f"Subject: {item['subject']}")
-        print(f"From: {item['sender']}")
-        print(f"Date: {item['date']}")
-        print(item["body"][:1000])
+                if status != "OK" or not data:
+                   
