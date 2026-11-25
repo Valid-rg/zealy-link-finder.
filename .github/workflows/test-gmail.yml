@@ -1,0 +1,34 @@
+name: Test Gmail
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-gmail:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test Gmail connection
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: |
+          PYTHONPATH=src python - <<'PY'
+          from gmail_scanner import scan_google_alerts
+
+          emails = list(scan_google_alerts())
+
+          print("Gmail connection successful.")
+          print(f"Google Alert emails found: {len(emails)}")
+
+          for index, item in enumerate(emails, start=1):
+              print(f"{index}. {item['subject']}")
+          PY
