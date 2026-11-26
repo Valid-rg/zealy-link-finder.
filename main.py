@@ -2,9 +2,8 @@
 """
 Zealy Link Finder + Credit Monitor
 
-Searches only for newer X posts using since_time,
-extracts Zealy campaign links, deduplicates them,
-sends new campaigns to Telegram, and tracks credits.
+Searches newer X posts, extracts Zealy campaign links,
+removes duplicates, sends Telegram alerts, and tracks credits.
 """
 
 from __future__ import annotations
@@ -31,8 +30,11 @@ LOW_CREDIT_THRESHOLD = 5000
 OVERLAP_SECONDS = 60
 FIRST_RUN_LOOKBACK_SECONDS = 7200
 
+API_REQUEST_INTERVAL = 5.2
+MAX_API_ATTEMPTS = 5
+
 ZEALY_PATTERN = re.compile(
-    r"https?://(?:www\.)?zealy\.io/cw/[^\s<>\"]+",
+    r"https?://(?:www\.)?zealy\.io/cw/[^\s<>\"']+",
     re.IGNORECASE,
 )
 
@@ -49,37 +51,66 @@ def get_secret(name: str) -> str:
 
 
 def api_request(url: str) -> dict:
-    request = urllib.request.Request(
-        url,
-        headers={
-            "X-API-Key": get_secret("TWITTERAPI_IO_API_KEY"),
-            "Accept": "application/json",
-        },
-        method="GET",
-    )
+    for attempt in range(MAX_API_ATTEMPTS):
 
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=30,
-        ) as response:
-            return json.loads(
-                response.read().decode("utf-8")
+        # Stay within the free-tier request limit.
+        time.sleep(API_REQUEST_INTERVAL)
+
+        request = urllib.request.Request(
+            url,
+            headers={
+                "X-API-Key": get_secret("TWITTERAPI_IO_API_KEY"),
+                "Accept": "application/json",
+            },
+            method="GET",
+        )
+
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=30,
+            ) as response:
+                return json.loads(
+                    response.read().decode("utf-8")
+                )
+
+        except urllib.error.HTTPError as error:
+            body = error.read().decode(
+                "utf-8",
+                errors="replace",
             )
 
-    except urllib.error.HTTPError as error:
-        body = error.read().decode(
-            "utf-8",
-            errors="replace",
-        )
-        raise RuntimeError(
-            f"TwitterAPI.io error ({error.code}): {body}"
-        ) from error
+            if error.code == 429 and attempt < MAX_API_ATTEMPTS - 1:
+                retry_after = error.headers.get("Retry-After")
 
-    except urllib.error.URLError as error:
-        raise RuntimeError(
-            f"Could not connect to TwitterAPI.io: {error.reason}"
-        ) from error
+                try:
+                    wait_time = max(
+                        10,
+                        int(float(retry_after))
+                    ) if retry_after else 10 * (attempt + 1)
+                except (ValueError, TypeError):
+                    wait_time = 10 * (attempt + 1)
+
+                print(
+                    f"Rate limit reached. "
+                    f"Waiting {wait_time} seconds before retry..."
+                )
+
+                time.sleep(wait_time)
+                continue
+
+            raise RuntimeError(
+                f"TwitterAPI.io error ({error.code}): {body}"
+            ) from error
+
+        except urllib.error.URLError as error:
+            raise RuntimeError(
+                f"Could not connect to TwitterAPI.io: {error.reason}"
+            ) from error
+
+    raise RuntimeError(
+        "TwitterAPI.io request failed after all retry attempts."
+    )
 
 
 def get_credit_balance() -> dict:
@@ -142,6 +173,7 @@ def extract_zealy_links(tweet: dict) -> list[str]:
 
     for item in entities.get("urls", []):
         expanded = item.get("expanded_url")
+
         if expanded:
             candidates.append(expanded)
 
@@ -193,7 +225,10 @@ def load_state() -> dict:
         return saved
 
     except Exception:
-        print("Could not read state.json. Starting with fresh state.")
+        print(
+            "Could not read state.json. "
+            "Starting with fresh state."
+        )
         return default_state
 
 
@@ -295,6 +330,7 @@ def send_telegram(message: str) -> None:
             "utf-8",
             errors="replace",
         )
+
         raise RuntimeError(
             f"Telegram error ({error.code}): {body}"
         ) from error
@@ -454,6 +490,7 @@ def main() -> None:
     known_tweet_ids = set(
         state.get("tweet_ids", [])
     )
+
     known_campaign_links = set(
         state.get("campaign_links", [])
     )
@@ -507,7 +544,7 @@ def main() -> None:
         send_telegram(message)
         print(f"Sent to Telegram: {link}")
 
-    # Save checkpoint only after search and notifications succeed.
+    # Save checkpoint after search and notifications succeed.
     state["last_search_timestamp"] = search_started
 
     # Check balance again.
@@ -552,4 +589,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-        
+    
