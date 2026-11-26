@@ -1,10 +1,9 @@
-
 """
 Zealy Link Finder + Credit Monitor
 
 Searches X through TwitterAPI.io, extracts Zealy campaign links,
 removes duplicates, sends new campaigns to Telegram, and monitors
-the TwitterAPI.io credit balance.
+both recharge and bonus credits.
 """
 
 from __future__ import annotations
@@ -82,15 +81,22 @@ def api_request(url: str) -> dict:
         ) from error
 
 
-def get_credit_balance() -> int:
+def get_credit_balance() -> dict:
     data = api_request(BALANCE_URL)
 
     if "recharge_credits" not in data:
         raise RuntimeError(
-            f"Balance response did not contain recharge_credits: {data}"
+            f"Balance response missing recharge_credits: {data}"
         )
 
-    return int(data["recharge_credits"])
+    recharge = int(data.get("recharge_credits") or 0)
+    bonus = int(data.get("total_bonus_credits") or 0)
+
+    return {
+        "recharge": recharge,
+        "bonus": bonus,
+        "total": recharge + bonus,
+    }
 
 
 def normalize_zealy_url(url: str) -> str | None:
@@ -324,8 +330,8 @@ def check_low_credit_warning(
 
     message = (
         "⚠️ TWITTERAPI.IO LOW CREDIT WARNING\n\n"
-        f"Remaining balance: {balance:,} credits\n"
-        f"Warning threshold: {LOW_CREDIT_THRESHOLD:,} credits\n\n"
+        f"Total remaining credits: {balance:,}\n"
+        f"Warning threshold: {LOW_CREDIT_THRESHOLD:,}\n\n"
         "Your Zealy Link Finder may stop searching "
         "if the balance reaches zero.\n"
         "Please check your TwitterAPI.io dashboard."
@@ -339,16 +345,24 @@ def check_low_credit_warning(
 
 def print_credit_report(
     state: dict,
-    balance: int | None,
+    balance: dict | None,
 ) -> None:
     usage = state.get("credit_usage", {})
 
     print("\n========== CREDIT REPORT ==========")
 
     if balance is not None:
-        print(f"Remaining credits: {balance:,}")
+        print(
+            f"Recharge credits: {balance['recharge']:,}"
+        )
+        print(
+            f"Bonus credits: {balance['bonus']:,}"
+        )
+        print(
+            f"TOTAL AVAILABLE: {balance['total']:,}"
+        )
     else:
-        print("Remaining credits: unavailable")
+        print("Balance: unavailable")
 
     print(
         "Credits used in this run: "
@@ -384,22 +398,29 @@ def main() -> None:
     balance_before = None
     balance_after = None
 
-    # Check the real account balance before searching.
+    # Check both recharge and bonus credits.
     try:
         balance_before = get_credit_balance()
+
         print(
-            f"Balance before search: {balance_before:,} credits"
+            f"Recharge balance: {balance_before['recharge']:,}"
+        )
+        print(
+            f"Bonus balance: {balance_before['bonus']:,}"
+        )
+        print(
+            f"Total before search: {balance_before['total']:,}"
         )
 
         check_low_credit_warning(
             state,
-            balance_before,
+            balance_before["total"],
         )
 
         save_state(state)
 
-        if balance_before <= 0:
-            print("Balance is zero. Skipping X search.")
+        if balance_before["total"] <= 0:
+            print("No credits available. Skipping X search.")
             print_credit_report(state, balance_before)
             return
 
@@ -407,7 +428,7 @@ def main() -> None:
         print(f"Could not check balance before search: {error}")
         print("Continuing with the campaign search.")
 
-    # Search X using the existing working search.
+    # Run the existing X campaign search.
     tweets = search_x()
 
     known_tweet_ids = set(
@@ -446,10 +467,10 @@ def main() -> None:
         known_campaign_links
     )[-2000:]
 
-    # Keep the existing campaign notifications.
     print(f"X search returned {len(tweets)} tweet(s).")
     print(f"New Zealy campaigns: {len(new_campaigns)}")
 
+    # Preserve the existing Telegram campaign alerts.
     for link, tweet in new_campaigns:
         username = (
             (tweet.get("author") or {})
@@ -469,18 +490,18 @@ def main() -> None:
 
         print(f"Sent to Telegram: {link}")
 
-    # Check the balance again to measure actual consumption.
+    # Measure actual balance change after the search.
     try:
         balance_after = get_credit_balance()
 
         print(
-            f"Balance after search: {balance_after:,} credits"
+            f"Total after search: {balance_after['total']:,}"
         )
 
         if balance_before is not None:
             credits_used = max(
                 0,
-                balance_before - balance_after,
+                balance_before["total"] - balance_after["total"],
             )
 
             record_credit_usage(
@@ -494,11 +515,11 @@ def main() -> None:
 
         check_low_credit_warning(
             state,
-            balance_after,
+            balance_after["total"],
         )
 
     except Exception as error:
-        print(f"Could not complete the after-search balance check: {error}")
+        print(f"Could not complete after-search balance check: {error}")
 
     save_state(state)
 
@@ -510,4 +531,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-                             
+        
