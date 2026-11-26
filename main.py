@@ -1,9 +1,10 @@
 
 """
-Zealy Link Finder
+Zealy Link Finder + Credit Monitor
 
 Searches X through TwitterAPI.io, extracts Zealy campaign links,
-removes duplicates, and sends new campaigns to Telegram.
+removes duplicates, sends new campaigns to Telegram, and monitors
+the TwitterAPI.io credit balance.
 """
 
 from __future__ import annotations
@@ -14,12 +15,18 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 
-API_URL = "https://api.twitterapi.io/twitter/tweet/advanced_search"
+API_BASE = "https://api.twitterapi.io"
+SEARCH_URL = f"{API_BASE}/twitter/tweet/advanced_search"
+BALANCE_URL = f"{API_BASE}/oapi/my/info"
+
 SEARCH_QUERY = '"zealy.io/cw/" -filter:replies'
 STATE_FILE = Path("state.json")
+
+LOW_CREDIT_THRESHOLD = 5000
 
 ZEALY_PATTERN = re.compile(
     r"https?://(?:www\.)?zealy\.io/cw/[^\s<>\"]+",
@@ -36,6 +43,54 @@ def get_secret(name: str) -> str:
         )
 
     return value
+
+
+def api_request(url: str) -> dict:
+    api_key = get_secret("TWITTERAPI_IO_API_KEY")
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "X-API-Key": api_key,
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=30,
+        ) as response:
+            return json.loads(
+                response.read().decode("utf-8")
+            )
+
+    except urllib.error.HTTPError as error:
+        body = error.read().decode(
+            "utf-8",
+            errors="replace",
+        )
+
+        raise RuntimeError(
+            f"TwitterAPI.io error ({error.code}): {body}"
+        ) from error
+
+    except urllib.error.URLError as error:
+        raise RuntimeError(
+            f"Could not connect to TwitterAPI.io: {error.reason}"
+        ) from error
+
+
+def get_credit_balance() -> int:
+    data = api_request(BALANCE_URL)
+
+    if "recharge_credits" not in data:
+        raise RuntimeError(
+            f"Balance response did not contain recharge_credits: {data}"
+        )
+
+    return int(data["recharge_credits"])
 
 
 def normalize_zealy_url(url: str) -> str | None:
@@ -74,17 +129,10 @@ def normalize_zealy_url(url: str) -> str | None:
 
 
 def extract_zealy_links(tweet: dict) -> list[str]:
-    """
-    Extract Zealy campaign URLs from:
-    - expanded X URLs
-    - tweet text
-    - X card URLs
-    """
-
     candidates: list[str] = []
 
-    text = tweet.get("text", "")
-    candidates.extend(ZEALY_PATTERN.findall(text))
+    tweet_text = tweet.get("text") or ""
+    candidates.extend(ZEALY_PATTERN.findall(tweet_text))
 
     entities = tweet.get("entities") or {}
 
@@ -126,23 +174,32 @@ def extract_zealy_links(tweet: dict) -> list[str]:
 
 
 def load_state() -> dict:
+    default_state = {
+        "tweet_ids": [],
+        "campaign_links": [],
+        "credit_usage": {},
+        "low_credit_alert_sent": False,
+    }
+
     if not STATE_FILE.exists():
-        return {
-            "tweet_ids": [],
-            "campaign_links": [],
-        }
+        return default_state
 
     try:
-        return json.loads(
-            STATE_FILE.read_text(
-                encoding="utf-8"
-            )
+        saved = json.loads(
+            STATE_FILE.read_text(encoding="utf-8")
         )
+
+        if not isinstance(saved, dict):
+            return default_state
+
+        for key, value in default_state.items():
+            saved.setdefault(key, value)
+
+        return saved
+
     except Exception:
-        return {
-            "tweet_ids": [],
-            "campaign_links": [],
-        }
+        print("Could not read state.json. Starting with fresh state.")
+        return default_state
 
 
 def save_state(state: dict) -> None:
@@ -157,10 +214,6 @@ def save_state(state: dict) -> None:
 
 
 def search_x() -> list[dict]:
-    api_key = get_secret(
-        "TWITTERAPI_IO_API_KEY"
-    )
-
     params = urllib.parse.urlencode(
         {
             "query": SEARCH_QUERY,
@@ -168,39 +221,9 @@ def search_x() -> list[dict]:
         }
     )
 
-    request = urllib.request.Request(
-        f"{API_URL}?{params}",
-        headers={
-            "X-API-Key": api_key,
-            "Accept": "application/json",
-        },
-        method="GET",
+    data = api_request(
+        f"{SEARCH_URL}?{params}"
     )
-
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=30,
-        ) as response:
-            data = json.loads(
-                response.read().decode("utf-8")
-            )
-
-    except urllib.error.HTTPError as error:
-        body = error.read().decode(
-            "utf-8",
-            errors="replace",
-        )
-
-        raise RuntimeError(
-            f"TwitterAPI.io error ({error.code}): {body}"
-        ) from error
-
-    except urllib.error.URLError as error:
-        raise RuntimeError(
-            f"Could not connect to TwitterAPI.io: "
-            f"{error.reason}"
-        ) from error
 
     if data.get("error"):
         raise RuntimeError(
@@ -211,13 +234,8 @@ def search_x() -> list[dict]:
 
 
 def send_telegram(message: str) -> None:
-    bot_token = get_secret(
-        "TELEGRAM_BOT_TOKEN"
-    )
-
-    chat_id = get_secret(
-        "TELEGRAM_CHAT_ID"
-    )
+    bot_token = get_secret("TELEGRAM_BOT_TOKEN")
+    chat_id = get_secret("TELEGRAM_CHAT_ID")
 
     url = (
         f"https://api.telegram.org/"
@@ -263,9 +281,133 @@ def send_telegram(message: str) -> None:
         )
 
 
+def record_credit_usage(
+    state: dict,
+    credits_used: int,
+) -> None:
+    now = datetime.now(timezone.utc)
+
+    today = now.strftime("%Y-%m-%d")
+    month = now.strftime("%Y-%m")
+
+    usage = state.setdefault("credit_usage", {})
+
+    if usage.get("day") != today:
+        usage["day"] = today
+        usage["day_credits"] = 0
+        usage["day_searches"] = 0
+
+    if usage.get("month") != month:
+        usage["month"] = month
+        usage["month_credits"] = 0
+        usage["month_searches"] = 0
+
+    usage["day_credits"] += credits_used
+    usage["day_searches"] += 1
+
+    usage["month_credits"] += credits_used
+    usage["month_searches"] += 1
+
+    usage["last_run_credits"] = credits_used
+
+
+def check_low_credit_warning(
+    state: dict,
+    balance: int,
+) -> None:
+    if balance > LOW_CREDIT_THRESHOLD:
+        state["low_credit_alert_sent"] = False
+        return
+
+    if state.get("low_credit_alert_sent"):
+        return
+
+    message = (
+        "⚠️ TWITTERAPI.IO LOW CREDIT WARNING\n\n"
+        f"Remaining balance: {balance:,} credits\n"
+        f"Warning threshold: {LOW_CREDIT_THRESHOLD:,} credits\n\n"
+        "Your Zealy Link Finder may stop searching "
+        "if the balance reaches zero.\n"
+        "Please check your TwitterAPI.io dashboard."
+    )
+
+    send_telegram(message)
+
+    state["low_credit_alert_sent"] = True
+    print("Low-credit Telegram warning sent.")
+
+
+def print_credit_report(
+    state: dict,
+    balance: int | None,
+) -> None:
+    usage = state.get("credit_usage", {})
+
+    print("\n========== CREDIT REPORT ==========")
+
+    if balance is not None:
+        print(f"Remaining credits: {balance:,}")
+    else:
+        print("Remaining credits: unavailable")
+
+    print(
+        "Credits used in this run: "
+        f"{usage.get('last_run_credits', 'unknown')}"
+    )
+
+    print(
+        "Credits used today (UTC): "
+        f"{usage.get('day_credits', 0):,}"
+    )
+
+    print(
+        "Searches today (UTC): "
+        f"{usage.get('day_searches', 0):,}"
+    )
+
+    print(
+        "Credits used this month (UTC): "
+        f"{usage.get('month_credits', 0):,}"
+    )
+
+    print(
+        "Searches this month (UTC): "
+        f"{usage.get('month_searches', 0):,}"
+    )
+
+    print("===================================\n")
+
+
 def main() -> None:
     state = load_state()
 
+    balance_before = None
+    balance_after = None
+
+    # Check the real account balance before searching.
+    try:
+        balance_before = get_credit_balance()
+        print(
+            f"Balance before search: {balance_before:,} credits"
+        )
+
+        check_low_credit_warning(
+            state,
+            balance_before,
+        )
+
+        save_state(state)
+
+        if balance_before <= 0:
+            print("Balance is zero. Skipping X search.")
+            print_credit_report(state, balance_before)
+            return
+
+    except Exception as error:
+        print(f"Could not check balance before search: {error}")
+        print("Continuing with the campaign search.")
+
+    # Search X using the existing working search.
     tweets = search_x()
 
     known_tweet_ids = set(
@@ -290,10 +432,7 @@ def main() -> None:
             if link in known_campaign_links:
                 continue
 
-            new_campaigns.append(
-                (link, tweet)
-            )
-
+            new_campaigns.append((link, tweet))
             known_campaign_links.add(link)
 
         if tweet_id:
@@ -307,16 +446,9 @@ def main() -> None:
         known_campaign_links
     )[-2000:]
 
-    save_state(state)
-
-    print(
-        f"X search returned {len(tweets)} tweet(s)."
-    )
-
-    print(
-        f"New Zealy campaigns: "
-        f"{len(new_campaigns)}"
-    )
+    # Keep the existing campaign notifications.
+    print(f"X search returned {len(tweets)} tweet(s).")
+    print(f"New Zealy campaigns: {len(new_campaigns)}")
 
     for link, tweet in new_campaigns:
         username = (
@@ -324,10 +456,7 @@ def main() -> None:
             .get("userName", "unknown")
         )
 
-        tweet_url = tweet.get(
-            "url",
-            "",
-        )
+        tweet_url = tweet.get("url", "")
 
         message = (
             "🚨 NEW ZEALY CAMPAIGN\n\n"
@@ -338,11 +467,47 @@ def main() -> None:
 
         send_telegram(message)
 
+        print(f"Sent to Telegram: {link}")
+
+    # Check the balance again to measure actual consumption.
+    try:
+        balance_after = get_credit_balance()
+
         print(
-            f"Sent to Telegram: {link}"
+            f"Balance after search: {balance_after:,} credits"
         )
+
+        if balance_before is not None:
+            credits_used = max(
+                0,
+                balance_before - balance_after,
+            )
+
+            record_credit_usage(
+                state,
+                credits_used,
+            )
+
+            print(
+                f"Credits consumed this run: {credits_used:,}"
+            )
+
+        check_low_credit_warning(
+            state,
+            balance_after,
+        )
+
+    except Exception as error:
+        print(f"Could not complete the after-search balance check: {error}")
+
+    save_state(state)
+
+    print_credit_report(
+        state,
+        balance_after,
+    )
 
 
 if __name__ == "__main__":
     main()
-        
+                             
