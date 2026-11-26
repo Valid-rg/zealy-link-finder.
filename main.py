@@ -1,3 +1,4 @@
+
 """
 Zealy Link Finder
 
@@ -10,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -84,7 +86,7 @@ def extract_zealy_links(tweet: dict) -> list[str]:
     text = tweet.get("text", "")
     candidates.extend(ZEALY_PATTERN.findall(text))
 
-    entities = tweet.get("entities", {})
+    entities = tweet.get("entities") or {}
 
     for item in entities.get("urls", []):
         expanded = item.get("expanded_url")
@@ -92,10 +94,10 @@ def extract_zealy_links(tweet: dict) -> list[str]:
         if expanded:
             candidates.append(expanded)
 
-    card = tweet.get("card", {})
+    card = tweet.get("card") or {}
 
     for binding in card.get("binding_values", []):
-        value = binding.get("value", {})
+        value = binding.get("value") or {}
 
         string_value = value.get("string_value")
 
@@ -318,7 +320,7 @@ def main() -> None:
 
     for link, tweet in new_campaigns:
         username = (
-            tweet.get("author", {})
+            (tweet.get("author") or {})
             .get("userName", "unknown")
         )
 
@@ -343,3 +345,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+        
