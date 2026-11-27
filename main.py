@@ -693,9 +693,12 @@ def print_tweet_diagnostics(
             print("Zealy links found: NONE")
             continue
 
-        for link in links:
-                        campaign_key = get_campaign_key(link)
-            already_known = campaign_key in known_campaign_keys
+                for link in links:
+                    campaign_key = 
+        get_campaign_key(link)
+                    already_known = 
+        campaign_key in 
+        known_campaign_keys
 
             print(f"Zealy link: {link}")
             print(f"Campaign key: {campaign_key}")
