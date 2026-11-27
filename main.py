@@ -543,29 +543,43 @@ def main() -> None:
         send_telegram(message)
         print(f"Sent to Telegram: {link}")
 
-    # Save the timestamp of the newest tweet actually received.
+        # Save the timestamp of the newest tweet actually received.
     # This keeps the next search anchored to real X data.
-    newest_tweet_timestamp = search_started
+    newest_tweet_timestamp = None
 
     for tweet in tweets:
-        tweet_id = str(tweet.get("id", ""))
+        created_at = tweet.get("createdAt")
 
-        if tweet_id.isdigit():
+        if created_at:
             try:
-                # Convert X Snowflake ID to Unix timestamp.
-                tweet_timestamp = (
-                    (int(tweet_id) >> 22) + 1288834974657
-                ) // 1000
-
-                newest_tweet_timestamp = max(
-                    newest_tweet_timestamp,
-                    tweet_timestamp,
+                tweet_time = datetime.fromisoformat(
+                    created_at.replace("Z", "+00:00")
                 )
 
-            except ValueError:
+                tweet_timestamp = int(
+                    tweet_time.timestamp()
+                )
+
+                if (
+                    newest_tweet_timestamp is None
+                    or tweet_timestamp > newest_tweet_timestamp
+                ):
+                    newest_tweet_timestamp = tweet_timestamp
+
+            except (ValueError, TypeError):
                 pass
 
+    # If no tweets were returned, advance the checkpoint
+    # to the time this search started.
+    if newest_tweet_timestamp is None:
+        newest_tweet_timestamp = search_started
+
     state["last_search_timestamp"] = newest_tweet_timestamp
+
+    print(
+        "Next search checkpoint timestamp: "
+        f"{newest_tweet_timestamp}"
+    )
 
     print(
         "Next search checkpoint timestamp: "
