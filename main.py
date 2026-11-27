@@ -1,4 +1,3 @@
-
 """
 Zealy Link Finder + Credit Monitor
 
@@ -544,8 +543,34 @@ def main() -> None:
         send_telegram(message)
         print(f"Sent to Telegram: {link}")
 
-    # Save checkpoint after search and notifications succeed.
-    state["last_search_timestamp"] = search_started
+    # Save the timestamp of the newest tweet actually received.
+    # This keeps the next search anchored to real X data.
+    newest_tweet_timestamp = search_started
+
+    for tweet in tweets:
+        tweet_id = str(tweet.get("id", ""))
+
+        if tweet_id.isdigit():
+            try:
+                # Convert X Snowflake ID to Unix timestamp.
+                tweet_timestamp = (
+                    (int(tweet_id) >> 22) + 1288834974657
+                ) // 1000
+
+                newest_tweet_timestamp = max(
+                    newest_tweet_timestamp,
+                    tweet_timestamp,
+                )
+
+            except ValueError:
+                pass
+
+    state["last_search_timestamp"] = newest_tweet_timestamp
+
+    print(
+        "Next search checkpoint timestamp: "
+        f"{newest_tweet_timestamp}"
+    )
 
     # Check balance again.
     try:
@@ -589,4 +614,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
