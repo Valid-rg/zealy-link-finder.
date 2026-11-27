@@ -1,8 +1,9 @@
 """
 Zealy Link Finder + Credit Monitor
 
-Searches newer X posts, extracts Zealy campaign links,
-removes duplicates, sends Telegram alerts, and tracks credits.
+Searches recent public X posts for Zealy campaign links,
+extracts campaign URLs, alerts Telegram once per campaign,
+and records search checkpoints and measured credit changes.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 
 API_BASE = "https://api.twitterapi.io"
@@ -29,6 +31,7 @@ LOW_CREDIT_THRESHOLD = 5000
 OVERLAP_SECONDS = 300
 FIRST_RUN_LOOKBACK_SECONDS = 7200
 
+# Brand-new TwitterAPI.io accounts are limited to one request per 5 seconds.
 API_REQUEST_INTERVAL = 5.2
 MAX_API_ATTEMPTS = 5
 
@@ -39,20 +42,21 @@ ZEALY_PATTERN = re.compile(
 
 
 def get_secret(name: str) -> str:
+    """Read a required secret from the environment."""
     value = os.environ.get(name)
-
     if not value:
         raise RuntimeError(
             f"Missing required environment variable: {name}"
         )
-
     return value
 
 
-def api_request(url: str) -> dict:
-    for attempt in range(MAX_API_ATTEMPTS):
+def api_request(url: str) -> dict[str, Any]:
+    """Make a paced API request with bounded retries for transient failures."""
+    last_error: Exception | None = None
 
-        # Stay within the free-tier request limit.
+    for attempt in range(MAX_API_ATTEMPTS):
+        # Keep requests below the free-tier QPS limit.
         time.sleep(API_REQUEST_INTERVAL)
 
         request = urllib.request.Request(
@@ -65,63 +69,103 @@ def api_request(url: str) -> dict:
         )
 
         try:
-            with urllib.request.urlopen(
-                request,
-                timeout=30,
-            ) as response:
-                return json.loads(
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = json.loads(
                     response.read().decode("utf-8")
                 )
+
+            if not isinstance(payload, dict):
+                raise RuntimeError(
+                    "TwitterAPI.io returned JSON that was not an object."
+                )
+
+            return payload
 
         except urllib.error.HTTPError as error:
             body = error.read().decode(
                 "utf-8",
                 errors="replace",
             )
+            last_error = error
 
-            if error.code == 429 and attempt < MAX_API_ATTEMPTS - 1:
-                retry_after = error.headers.get("Retry-After")
+            retryable = (
+                error.code in {408, 425, 429}
+                or 500 <= error.code <= 599
+            )
 
-                try:
-                    wait_time = max(
-                        10,
-                        int(float(retry_after))
-                    ) if retry_after else 10 * (attempt + 1)
-                except (ValueError, TypeError):
-                    wait_time = 10 * (attempt + 1)
+            if not retryable or attempt == MAX_API_ATTEMPTS - 1:
+                raise RuntimeError(
+                    f"TwitterAPI.io error ({error.code}): {body}"
+                ) from error
 
-                print(
-                    f"Rate limit reached. "
-                    f"Waiting {wait_time} seconds before retry..."
+            # TwitterAPI.io normally does not send Retry-After headers.
+            # Respect one if it is present; otherwise use exponential backoff.
+            retry_after = error.headers.get("Retry-After")
+            try:
+                wait_time = (
+                    max(
+                        API_REQUEST_INTERVAL,
+                        float(retry_after),
+                    )
+                    if retry_after
+                    else min(
+                        60.0,
+                        API_REQUEST_INTERVAL * (2 ** attempt),
+                    )
+                )
+            except (ValueError, TypeError):
+                wait_time = min(
+                    60.0,
+                    API_REQUEST_INTERVAL * (2 ** attempt),
                 )
 
-                time.sleep(wait_time)
-                continue
+            print(
+                f"Temporary API error ({error.code}). "
+                f"Retrying after {wait_time:.1f} seconds..."
+            )
+            time.sleep(wait_time)
 
-            raise RuntimeError(
-                f"TwitterAPI.io error ({error.code}): {body}"
-            ) from error
+        except (urllib.error.URLError, TimeoutError) as error:
+            last_error = error
 
-        except urllib.error.URLError as error:
-            raise RuntimeError(
-                f"Could not connect to TwitterAPI.io: {error.reason}"
-            ) from error
+            if attempt == MAX_API_ATTEMPTS - 1:
+                reason = getattr(error, "reason", str(error))
+                raise RuntimeError(
+                    f"Could not connect to TwitterAPI.io: {reason}"
+                ) from error
+
+            wait_time = min(
+                60.0,
+                API_REQUEST_INTERVAL * (2 ** attempt),
+            )
+            print(
+                "Temporary connection problem. "
+                f"Retrying after {wait_time:.1f} seconds..."
+            )
+            time.sleep(wait_time)
 
     raise RuntimeError(
-        "TwitterAPI.io request failed after all retry attempts."
+        f"TwitterAPI.io request failed after all retry attempts: {last_error}"
     )
 
 
-def get_credit_balance() -> dict:
+def get_credit_balance() -> dict[str, int]:
+    """Return recharge, bonus, and total available credits."""
     data = api_request(BALANCE_URL)
 
     if "recharge_credits" not in data:
         raise RuntimeError(
-            f"Balance response missing recharge_credits: {data}"
+            "Balance response is missing recharge_credits. "
+            f"Response: {data}"
         )
 
-    recharge = int(data.get("recharge_credits") or 0)
-    bonus = int(data.get("total_bonus_credits") or 0)
+    try:
+        recharge = int(float(data.get("recharge_credits") or 0))
+        bonus = int(float(data.get("total_bonus_credits") or 0))
+    except (ValueError, TypeError) as error:
+        raise RuntimeError(
+            f"Balance response contains invalid credit values: {data}"
+        ) from error
 
     return {
         "recharge": recharge,
@@ -131,20 +175,26 @@ def get_credit_balance() -> dict:
 
 
 def normalize_zealy_url(url: str) -> str | None:
+    """Validate and normalize a Zealy campaign URL."""
+    if not isinstance(url, str):
+        return None
+
     url = url.strip().rstrip(".,;:!?)]}>\"'")
 
     try:
         parsed = urllib.parse.urlsplit(url)
+        hostname = (parsed.hostname or "").lower()
+        port = parsed.port
     except ValueError:
         return None
 
     if parsed.scheme.lower() != "https":
         return None
 
-    if parsed.netloc.lower() not in {
-        "zealy.io",
-        "www.zealy.io",
-    }:
+    if hostname not in {"zealy.io", "www.zealy.io"}:
+        return None
+
+    if port not in (None, 443):
         return None
 
     if not parsed.path.lower().startswith("/cw/"):
@@ -161,36 +211,79 @@ def normalize_zealy_url(url: str) -> str | None:
     )
 
 
-def extract_zealy_links(tweet: dict) -> list[str]:
-    candidates = []
+def get_campaign_key(url: str) -> str | None:
+    """Use the campaign slug so path variants count as one campaign."""
+    normalized = normalize_zealy_url(url)
+    if not normalized:
+        return None
 
-    candidates.extend(
-        ZEALY_PATTERN.findall(tweet.get("text") or "")
-    )
+    try:
+        parsed = urllib.parse.urlsplit(normalized)
+    except ValueError:
+        return None
+
+    parts = [
+        urllib.parse.unquote(part)
+        for part in parsed.path.split("/")
+        if part
+    ]
+
+    if len(parts) < 2 or parts[0].lower() != "cw":
+        return None
+
+    campaign_slug = parts[1].strip().casefold()
+    return campaign_slug or None
+
+
+def extract_zealy_links(tweet: dict[str, Any]) -> list[str]:
+    """Find Zealy links in tweet text, URL entities, and X cards."""
+    candidates: list[str] = []
+
+    tweet_text = tweet.get("text")
+    if isinstance(tweet_text, str):
+        candidates.extend(ZEALY_PATTERN.findall(tweet_text))
 
     entities = tweet.get("entities") or {}
+    if isinstance(entities, dict):
+        entity_urls = entities.get("urls") or []
+        if isinstance(entity_urls, list):
+            for item in entity_urls:
+                if not isinstance(item, dict):
+                    continue
 
-    for item in entities.get("urls", []):
-        expanded = item.get("expanded_url")
-
-        if expanded:
-            candidates.append(expanded)
+                for field in ("expanded_url", "unwound_url"):
+                    value = item.get(field)
+                    if isinstance(value, str) and value:
+                        candidates.append(value)
 
     card = tweet.get("card") or {}
+    if isinstance(card, dict):
+        binding_values = card.get("binding_values") or {}
 
-    for binding in card.get("binding_values", []):
-        value = binding.get("value") or {}
-        string_value = value.get("string_value")
+        if isinstance(binding_values, dict):
+            bindings = list(binding_values.values())
+        elif isinstance(binding_values, list):
+            bindings = binding_values
+        else:
+            bindings = []
 
-        if string_value:
-            candidates.append(string_value)
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                continue
 
-    found = []
-    seen = set()
+            value = binding.get("value") or binding
+            if not isinstance(value, dict):
+                continue
+
+            string_value = value.get("string_value")
+            if isinstance(string_value, str) and string_value:
+                candidates.append(string_value)
+
+    found: list[str] = []
+    seen: set[str] = set()
 
     for candidate in candidates:
         normalized = normalize_zealy_url(candidate)
-
         if normalized and normalized not in seen:
             seen.add(normalized)
             found.append(normalized)
@@ -198,10 +291,40 @@ def extract_zealy_links(tweet: dict) -> list[str]:
     return found
 
 
-def load_state() -> dict:
-    default_state = {
+def parse_tweet_timestamp(created_at: Any) -> int | None:
+    """Parse TwitterAPI.io's classic X timestamp, with ISO fallback."""
+    if not isinstance(created_at, str) or not created_at.strip():
+        return None
+
+    value = created_at.strip()
+
+    # Current TwitterAPI.io tweet responses commonly use this format:
+    # Thu Oct 16 12:34:56 +0000 2026
+    try:
+        tweet_time = datetime.strptime(
+            value,
+            "%a %b %d %H:%M:%S %z %Y",
+        )
+    except ValueError:
+        try:
+            tweet_time = datetime.fromisoformat(
+                value.replace("Z", "+00:00")
+            )
+        except ValueError:
+            return None
+
+    if tweet_time.tzinfo is None:
+        tweet_time = tweet_time.replace(tzinfo=timezone.utc)
+
+    return int(tweet_time.timestamp())
+
+
+def load_state() -> dict[str, Any]:
+    """Load state and migrate campaign keys from older state files."""
+    default_state: dict[str, Any] = {
         "tweet_ids": [],
         "campaign_links": [],
+        "campaign_keys": [],
         "credit_usage": {},
         "low_credit_alert_sent": False,
         "last_search_timestamp": None,
@@ -216,23 +339,76 @@ def load_state() -> dict:
         )
 
         if not isinstance(saved, dict):
+            print("state.json is not a JSON object. Starting fresh.")
             return default_state
 
         for key, value in default_state.items():
             saved.setdefault(key, value)
 
+        # Repair malformed or missing collections without discarding
+        # other valid saved fields.
+        for key in ("tweet_ids", "campaign_links", "campaign_keys"):
+            if not isinstance(saved.get(key), list):
+                saved[key] = []
+
+        if not isinstance(saved.get("credit_usage"), dict):
+            saved["credit_usage"] = {}
+
+        saved["tweet_ids"] = [
+            str(item) for item in saved["tweet_ids"] if item is not None
+        ]
+        saved["campaign_links"] = [
+            str(item) for item in saved["campaign_links"] if item
+        ]
+
+        campaign_keys: list[str] = []
+        campaign_key_set: set[str] = set()
+
+        # Preserve insertion order so the 2,000-item limit retains
+        # the most recently detected campaigns.
+        for item in saved["campaign_keys"]:
+            key = str(item).casefold() if item else ""
+            if key and key not in campaign_key_set:
+                campaign_key_set.add(key)
+                campaign_keys.append(key)
+
+        # Migrate keys from campaigns recorded by older versions.
+        for link in saved["campaign_links"]:
+            key = get_campaign_key(link)
+            if key and key not in campaign_key_set:
+                campaign_key_set.add(key)
+                campaign_keys.append(key)
+
+        saved["campaign_keys"] = campaign_keys[-2000:]
+
+        checkpoint = saved.get("last_search_timestamp")
+        if checkpoint is not None:
+            try:
+                saved["last_search_timestamp"] = int(checkpoint)
+            except (ValueError, TypeError):
+                saved["last_search_timestamp"] = None
+
+        saved["low_credit_alert_sent"] = bool(
+            saved.get("low_credit_alert_sent")
+        )
+
         return saved
 
-    except Exception:
+    except (OSError, json.JSONDecodeError) as error:
         print(
-            "Could not read state.json. "
-            "Starting with fresh state."
+            "Could not read state.json. Starting with fresh state: "
+            f"{error}"
         )
         return default_state
 
 
-def save_state(state: dict) -> None:
-    STATE_FILE.write_text(
+def save_state(state: dict[str, Any]) -> None:
+    """Write state atomically so an interrupted write does not corrupt it."""
+    temporary_file = STATE_FILE.with_name(
+        f"{STATE_FILE.name}.tmp"
+    )
+
+    temporary_file.write_text(
         json.dumps(
             state,
             indent=2,
@@ -241,17 +417,26 @@ def save_state(state: dict) -> None:
         encoding="utf-8",
     )
 
+    temporary_file.replace(STATE_FILE)
 
-def search_x(since_timestamp: int) -> list[dict]:
+
+def search_x(since_timestamp: int) -> tuple[list[dict[str, Any]], bool]:
+    """Search all available pages; report whether pagination completed."""
     query = (
         f"{SEARCH_QUERY} "
         f"since_time:{since_timestamp}"
     )
 
-    tweets = []
+    tweets: list[dict[str, Any]] = []
     cursor = ""
+    pagination_complete = True
+    page_number = 0
+
+    print(f"Twitter search query: {query}")
 
     while True:
+        page_number += 1
+
         params = {
             "query": query,
             "queryType": "Latest",
@@ -267,37 +452,55 @@ def search_x(since_timestamp: int) -> list[dict]:
 
         data = api_request(url)
 
-        if data.get("error"):
+        if data.get("error") or data.get("status") == "error":
             raise RuntimeError(
-                f"TwitterAPI.io returned an error: {data}"
+                "TwitterAPI.io search returned an error: "
+                f"{data}"
             )
 
         page_tweets = data.get("tweets") or []
-        tweets.extend(page_tweets)
+        if not isinstance(page_tweets, list):
+            raise RuntimeError(
+                "TwitterAPI.io search response has an invalid tweets field. "
+                f"Response: {data}"
+            )
 
-        print(
-            f"Search page returned {len(page_tweets)} tweet(s)."
+        tweets.extend(
+            tweet for tweet in page_tweets
+            if isinstance(tweet, dict)
         )
 
-        if not data.get("has_next_page"):
+        print(
+            f"Search page {page_number} returned "
+            f"{len(page_tweets)} tweet(s)."
+        )
+
+        # A short page does not necessarily mean pagination is over.
+        # Continue only when the API provides a usable next cursor.
+        if not page_tweets or not data.get("has_next_page"):
             break
 
         next_cursor = data.get("next_cursor")
-
         if not next_cursor or next_cursor == cursor:
+            print(
+                "Pagination stopped because the API did not provide "
+                "a new cursor. The checkpoint will not advance."
+            )
+            pagination_complete = False
             break
 
-        cursor = next_cursor
+        cursor = str(next_cursor)
 
-    return tweets
+    return tweets, pagination_complete
 
 
 def send_telegram(message: str) -> None:
+    """Send one Telegram message and verify Telegram accepted it."""
     bot_token = get_secret("TELEGRAM_BOT_TOKEN")
     chat_id = get_secret("TELEGRAM_CHAT_ID")
 
     url = (
-        f"https://api.telegram.org/"
+        "https://api.telegram.org/"
         f"bot{bot_token}/sendMessage"
     )
 
@@ -316,34 +519,30 @@ def send_telegram(message: str) -> None:
     )
 
     try:
-        with urllib.request.urlopen(
-            request,
-            timeout=30,
-        ) as response:
+        with urllib.request.urlopen(request, timeout=30) as response:
             result = json.loads(
                 response.read().decode("utf-8")
             )
-
     except urllib.error.HTTPError as error:
         body = error.read().decode(
             "utf-8",
             errors="replace",
         )
-
         raise RuntimeError(
             f"Telegram error ({error.code}): {body}"
         ) from error
 
-    if not result.get("ok"):
+    if not isinstance(result, dict) or not result.get("ok"):
         raise RuntimeError(
             f"Telegram returned an error: {result}"
         )
 
 
 def record_credit_usage(
-    state: dict,
-    credits_used: int,
+    state: dict[str, Any],
+    measured_decrease: int,
 ) -> None:
+    """Record the observed before/after balance decrease."""
     now = datetime.now(timezone.utc)
     today = now.strftime("%Y-%m-%d")
     month = now.strftime("%Y-%m")
@@ -360,17 +559,31 @@ def record_credit_usage(
         usage["month_credits"] = 0
         usage["month_searches"] = 0
 
-    usage["day_credits"] += credits_used
+    # Coerce older saved values safely in case a prior state file
+    # contains strings or is missing one of these counters.
+    for field in (
+        "day_credits",
+        "day_searches",
+        "month_credits",
+        "month_searches",
+    ):
+        try:
+            usage[field] = int(usage.get(field, 0) or 0)
+        except (ValueError, TypeError):
+            usage[field] = 0
+
+    usage["day_credits"] += measured_decrease
     usage["day_searches"] += 1
-    usage["month_credits"] += credits_used
+    usage["month_credits"] += measured_decrease
     usage["month_searches"] += 1
-    usage["last_run_credits"] = credits_used
+    usage["last_run_credits"] = measured_decrease
 
 
 def check_low_credit_warning(
-    state: dict,
+    state: dict[str, Any],
     balance: int,
 ) -> None:
+    """Send one warning when credits reach the configured threshold."""
     if balance > LOW_CREDIT_THRESHOLD:
         state["low_credit_alert_sent"] = False
         return
@@ -390,9 +603,11 @@ def check_low_credit_warning(
 
 
 def print_credit_report(
-    state: dict,
-    balance: dict | None,
+    state: dict[str, Any],
+    balance: dict[str, int] | None,
+    measured_decrease_this_run: int | None = None,
 ) -> None:
+    """Print the current balance and measured usage totals."""
     usage = state.get("credit_usage", {})
 
     print("\n========== CREDIT REPORT ==========")
@@ -404,227 +619,79 @@ def print_credit_report(
     else:
         print("Balance: unavailable")
 
-    print(
-        f"Credits used this run: "
-        f"{usage.get('last_run_credits', 'unknown')}"
+    current_run_value = (
+        f"{measured_decrease_this_run:,}"
+        if measured_decrease_this_run is not None
+        else "unavailable"
     )
     print(
-        f"Credits used today (UTC): "
+        "Measured balance decrease this run: "
+        f"{current_run_value}"
+    )
+    print(
+        "Measured balance decrease today (UTC): "
         f"{usage.get('day_credits', 0):,}"
     )
     print(
-        f"Searches today (UTC): "
+        "Runs measured today (UTC): "
         f"{usage.get('day_searches', 0):,}"
     )
     print(
-        f"Credits used this month (UTC): "
+        "Measured balance decrease this month (UTC): "
         f"{usage.get('month_credits', 0):,}"
     )
     print(
-        f"Searches this month (UTC): "
+        "Runs measured this month (UTC): "
         f"{usage.get('month_searches', 0):,}"
     )
 
     print("===================================\n")
 
 
-def main() -> None:
-    state = load_state()
+def print_tweet_diagnostics(
+    tweets: list[dict[str, Any]],
+    known_campaign_keys: set[str],
+) -> None:
+    """Log returned tweets and extracted links for missed-alert debugging."""
+    print("\n========== SEARCH RESULTS ==========")
 
-    balance_before = None
-    balance_after = None
+    if not tweets:
+        print("No tweets were returned by TwitterAPI.io.")
+        print("===================================\n")
+        return
 
-    search_started = int(time.time())
+    for index, tweet in enumerate(tweets, start=1):
+        tweet_id = str(tweet.get("id") or "unknown")
+        author = tweet.get("author") or {}
 
-    previous_search = state.get("last_search_timestamp")
+        if isinstance(author, dict):
+            username = (
+                author.get("userName")
+                or author.get("username")
+                or "unknown"
+            )
+        else:
+            username = "unknown"
 
-    if previous_search:
-        since_timestamp = max(
-            0,
-            int(previous_search) - OVERLAP_SECONDS,
+        created_at = tweet.get("createdAt") or "unknown"
+        tweet_text = tweet.get("text")
+        text_preview = (
+            tweet_text.replace("\n", " ")[:500]
+            if isinstance(tweet_text, str)
+            else ""
         )
-    else:
-        since_timestamp = (
-            search_started - FIRST_RUN_LOOKBACK_SECONDS
-        )
-
-    print(
-        "Searching for posts newer than Unix timestamp: "
-        f"{since_timestamp}"
-    )
-
-    # Check account balance before searching.
-    try:
-        balance_before = get_credit_balance()
-
-        print(
-            f"Recharge credits: {balance_before['recharge']:,}"
-        )
-        print(
-            f"Bonus credits: {balance_before['bonus']:,}"
-        )
-        print(
-            f"Total available: {balance_before['total']:,}"
-        )
-
-        check_low_credit_warning(
-            state,
-            balance_before["total"],
-        )
-
-        save_state(state)
-
-        if balance_before["total"] <= 0:
-            print("No credits available. Skipping X search.")
-            print_credit_report(state, balance_before)
-            return
-
-    except Exception as error:
-        print(f"Balance check failed: {error}")
-        print("Continuing with X search.")
-
-    # Search only the new time window.
-    tweets = search_x(since_timestamp)
-
-    known_tweet_ids = set(
-        state.get("tweet_ids", [])
-    )
-
-    known_campaign_links = set(
-        state.get("campaign_links", [])
-    )
-
-    new_campaigns = []
-
-    for tweet in tweets:
-        tweet_id = str(tweet.get("id", ""))
-
-        if tweet_id and tweet_id in known_tweet_ids:
-            continue
 
         links = extract_zealy_links(tweet)
 
+        print(f"\nTweet #{index}")
+        print(f"Username: @{username}")
+        print(f"Tweet ID: {tweet_id}")
+        print(f"Created: {created_at}")
+        print(f"Text: {text_preview}")
+
+        if not links:
+            print("Zealy links found: NONE")
+            continue
+
         for link in links:
-            if link in known_campaign_links:
-                continue
-
-            new_campaigns.append((link, tweet))
-            known_campaign_links.add(link)
-
-        if tweet_id:
-            known_tweet_ids.add(tweet_id)
-
-    state["tweet_ids"] = list(
-        known_tweet_ids
-    )[-1000:]
-
-    state["campaign_links"] = list(
-        known_campaign_links
-    )[-2000:]
-
-    print(f"Total tweets returned: {len(tweets)}")
-    print(f"New Zealy campaigns: {len(new_campaigns)}")
-
-    for link, tweet in new_campaigns:
-        username = (
-            (tweet.get("author") or {})
-            .get("userName", "unknown")
-        )
-
-        tweet_url = tweet.get("url", "")
-
-        message = (
-            "🚨 NEW ZEALY CAMPAIGN\n\n"
-            f"🔗 {link}\n\n"
-            f"👤 @{username}\n"
-            f"🐦 {tweet_url}"
-        )
-
-        send_telegram(message)
-        print(f"Sent to Telegram: {link}")
-
-        # Save the timestamp of the newest tweet actually received.
-    # This keeps the next search anchored to real X data.
-    newest_tweet_timestamp = None
-
-    for tweet in tweets:
-        created_at = tweet.get("createdAt")
-
-        if created_at:
-            try:
-                tweet_time = datetime.fromisoformat(
-                    created_at.replace("Z", "+00:00")
-                )
-
-                tweet_timestamp = int(
-                    tweet_time.timestamp()
-                )
-
-                if (
-                    newest_tweet_timestamp is None
-                    or tweet_timestamp > newest_tweet_timestamp
-                ):
-                    newest_tweet_timestamp = tweet_timestamp
-
-            except (ValueError, TypeError):
-                pass
-
-    # If no tweets were returned, advance the checkpoint
-    # to the time this search started.
-    if newest_tweet_timestamp is None:
-        newest_tweet_timestamp = search_started
-
-    state["last_search_timestamp"] = newest_tweet_timestamp
-
-    print(
-        "Next search checkpoint timestamp: "
-        f"{newest_tweet_timestamp}"
-    )
-
-    print(
-        "Next search checkpoint timestamp: "
-        f"{newest_tweet_timestamp}"
-    )
-
-    # Check balance again.
-    try:
-        balance_after = get_credit_balance()
-
-        print(
-            f"Total balance after search: "
-            f"{balance_after['total']:,}"
-        )
-
-        if balance_before is not None:
-            credits_used = max(
-                0,
-                balance_before["total"] - balance_after["total"],
-            )
-
-            record_credit_usage(
-                state,
-                credits_used,
-            )
-
-            print(
-                f"Measured credits used: {credits_used:,}"
-            )
-
-        check_low_credit_warning(
-            state,
-            balance_after["total"],
-        )
-
-    except Exception as error:
-        print(f"After-search balance check failed: {error}")
-
-    save_state(state)
-
-    print_credit_report(
-        state,
-        balance_after,
-    )
-
-
-if __name__ == "__main__":
-    main()
+            campaign_key = get_campaign_ke
