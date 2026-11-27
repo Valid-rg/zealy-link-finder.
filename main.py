@@ -694,4 +694,259 @@ def print_tweet_diagnostics(
             continue
 
         for link in links:
-            campaign_key = get_campaign_ke
+                        campaign_key = get_campaign_key(link)
+            already_known = campaign_key in known_campaign_keys
+
+            print(f"Zealy link: {link}")
+            print(f"Campaign key: {campaign_key}")
+            print(f"Already known: {already_known}")
+
+    def main() -> None:
+    """Run one complete Zealy monitoring cycle."""
+    state = load_state()
+
+    search_started = int(datetime.now(timezone.utc).timestamp())
+    previous_checkpoint = state.get("last_search_timestamp")
+
+    if previous_checkpoint is None:
+        since_timestamp = (
+            search_started - FIRST_RUN_LOOKBACK_SECONDS
+        )
+        print(
+            "No previous checkpoint found. "
+            f"Searching the last {FIRST_RUN_LOOKBACK_SECONDS // 3600} hours."
+        )
+    else:
+        since_timestamp = (
+            int(previous_checkpoint) - OVERLAP_SECONDS
+        )
+        print(
+            f"Previous checkpoint: {previous_checkpoint}"
+        )
+        print(
+            f"Searching from checkpoint minus "
+            f"{OVERLAP_SECONDS} seconds: {since_timestamp}"
+        )
+
+    known_tweet_ids = {
+        str(tweet_id)
+        for tweet_id in state.get("tweet_ids", [])
+    }
+
+    known_campaign_keys = {
+        str(key).casefold()
+        for key in state.get("campaign_keys", [])
+        if key
+    }
+
+    print("\n========== ZEALY MONITOR ==========")
+    print(f"Search started: {search_started}")
+    print(f"Known tweets: {len(known_tweet_ids):,}")
+    print(f"Known campaigns: {len(known_campaign_keys):,}")
+
+    balance_before: dict[str, int] | None = None
+
+    try:
+        balance_before = get_credit_balance()
+        print(
+            f"Credits before search: "
+            f"{balance_before['total']:,}"
+        )
+    except Exception as error:
+        print(
+            "Could not read credit balance before search: "
+            f"{error}"
+        )
+
+    tweets, pagination_complete = search_x(since_timestamp)
+
+    print(f"\nTotal tweets returned: {len(tweets):,}")
+    print(
+        f"Pagination complete: "
+        f"{'YES' if pagination_complete else 'NO'}"
+    )
+
+    print_tweet_diagnostics(
+        tweets,
+        known_campaign_keys,
+    )
+
+    new_campaigns = 0
+    skipped_old_tweets = 0
+    telegram_failures = 0
+
+    newest_tweet_timestamp: int | None = None
+
+    for tweet in tweets:
+        tweet_id = str(tweet.get("id") or "")
+
+        if tweet_id and tweet_id in known_tweet_ids:
+            skipped_old_tweets += 1
+            continue
+
+        created_timestamp = parse_tweet_timestamp(
+            tweet.get("createdAt")
+        )
+
+        if (
+            created_timestamp is not None
+            and (
+                newest_tweet_timestamp is None
+                or created_timestamp > newest_tweet_timestamp
+            )
+        ):
+            newest_tweet_timestamp = created_timestamp
+
+        links = extract_zealy_links(tweet)
+
+        if tweet_id:
+            known_tweet_ids.add(tweet_id)
+
+        if not links:
+            continue
+
+        author = tweet.get("author") or {}
+
+        if isinstance(author, dict):
+            username = (
+                author.get("userName")
+                or author.get("username")
+                or "unknown"
+            )
+        else:
+            username = "unknown"
+
+        tweet_url = (
+            f"https://x.com/{username}/status/{tweet_id}"
+            if tweet_id and username != "unknown"
+            else ""
+        )
+
+        for link in links:
+            campaign_key = get_campaign_key(link)
+
+            if not campaign_key:
+                continue
+
+            if campaign_key in known_campaign_keys:
+                print(
+                    f"Skipping known campaign: {link}"
+                )
+                continue
+
+            message = (
+                "🚨 NEW ZEALY CAMPAIGN\n\n"
+                f"🔗 {link}\n\n"
+                f"👤 @{username}"
+            )
+
+            if tweet_url:
+                message += f"\n🐦 {tweet_url}"
+
+            try:
+                send_telegram(message)
+
+                known_campaign_keys.add(campaign_key)
+
+                campaign_links = state.setdefault(
+                    "campaign_links",
+                    [],
+                )
+
+                if link not in campaign_links:
+                    campaign_links.append(link)
+
+                new_campaigns += 1
+
+                print(
+                    f"Telegram alert sent: {link}"
+                )
+
+            except Exception as error:
+                telegram_failures += 1
+                print(
+                    "Telegram alert failed for "
+                    f"{link}: {error}"
+                )
+
+    state["tweet_ids"] = list(known_tweet_ids)[-5000:]
+    state["campaign_keys"] = list(known_campaign_keys)[-2000:]
+
+    if pagination_complete:
+        if newest_tweet_timestamp is not None:
+            state["last_search_timestamp"] = (
+                newest_tweet_timestamp
+            )
+            print(
+                "Checkpoint advanced to newest returned "
+                f"tweet: {newest_tweet_timestamp}"
+            )
+        elif previous_checkpoint is None:
+            state["last_search_timestamp"] = search_started
+            print(
+                "No tweets were returned on the first run. "
+                "Initial checkpoint established."
+            )
+        else:
+            print(
+                "No usable new tweet timestamp was found. "
+                "Existing checkpoint preserved."
+            )
+    else:
+        print(
+            "Pagination was incomplete. "
+            "Existing checkpoint preserved."
+        )
+
+    balance_after: dict[str, int] | None = None
+    measured_decrease = 0
+
+    try:
+        balance_after = get_credit_balance()
+        print(
+            f"Credits after search: "
+            f"{balance_after['total']:,}"
+        )
+
+        if balance_before is not None:
+            measured_decrease = max(
+                0,
+                balance_before["total"]
+                - balance_after["total"],
+            )
+
+        record_credit_usage(
+            state,
+            measured_decrease,
+        )
+
+        check_low_credit_warning(
+            state,
+            balance_after["total"],
+        )
+
+    except Exception as error:
+        print(
+            "Could not complete the after-search "
+            f"credit check: {error}"
+        )
+
+    save_state(state)
+
+    print("\n========== RUN SUMMARY ==========")
+    print(f"Tweets returned: {len(tweets):,}")
+    print(f"Old tweets skipped: {skipped_old_tweets:,}")
+    print(f"New Zealy campaigns: {new_campaigns:,}")
+    print(f"Telegram failures: {telegram_failures:,}")
+    print(
+        f"Measured credits used: "
+        f"{measured_decrease:,}"
+    )
+    print("State saved successfully.")
+    print("=================================\n")
+
+
+if __name__ == "__main__":
+    main()
+
+print("===================================\n")
